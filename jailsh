@@ -1,0 +1,502 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+DEFAULT_CONFIG="$XDG_CONFIG_HOME/jailsh/config.ini"
+LEGACY_CONFIG="$HOME/.jailsh.ini"
+
+if [[ -n "${JAILSH_CONFIG:-}" ]]; then
+  CONFIG="$JAILSH_CONFIG"
+elif [[ -f "$DEFAULT_CONFIG" || ! -f "$LEGACY_CONFIG" ]]; then
+  CONFIG="$DEFAULT_CONFIG"
+else
+  CONFIG="$LEGACY_CONFIG"
+fi
+PROFILE="${1:-}"
+CMD=("${@:2}")
+
+usage() {
+  cat >&2 <<'USAGE'
+jailsh — run a sandboxed Bash shell with filesystem access restricted by Landlock
+
+Usage:
+  jailsh PROFILE             start a shell using the named profile
+  jailsh PROFILE CMD [ARG…]  run a command inside the sandbox and exit
+  jailsh --list              list profiles from the config file
+  jailsh --help              show this help
+
+Config file:
+  ~/.config/jailsh/config.ini   (or $XDG_CONFIG_HOME/jailsh/config.ini)
+  Created automatically on first run if it does not exist.
+
+Profile keys:
+  start=DIR   working directory when the shell opens (optional; defaults to first rw= path)
+  rw=PATH     allow read, write, and execute under PATH
+  ro=PATH     allow read and execute under PATH (no writes)
+
+Path values support tilde and variable expansion: ~  $HOME  $PWD
+USAGE
+  exit 2
+}
+
+trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+expand_path() {
+  local raw="$1"
+
+  if [[ "$raw" == "~" ]]; then
+    raw="$HOME"
+  elif [[ "${raw:0:2}" == "~/" ]]; then
+    raw="$HOME/${raw:2}"
+  fi
+
+  raw="${raw//\$HOME/$HOME}"
+  raw="${raw//\$\{HOME\}/$HOME}"
+  raw="${raw//\$PWD/$PWD}"
+  raw="${raw//\$\{PWD\}/$PWD}"
+
+  if [[ "$raw" != /* ]]; then
+    raw="$HOME/$raw"
+  fi
+
+  readlink -m -- "$raw"
+}
+
+create_default_config() {
+  mkdir -p -- "$(dirname "$CONFIG")"
+
+  cat > "$CONFIG" <<'EOF'
+# jailsh profile config
+#
+# Keys:
+#   start=DIR   shell starts here
+#   rw=PATH     read/write access below PATH
+#   ro=PATH     read-only access below PATH
+#
+# Variables expanded at runtime:
+#   $HOME, ${HOME}, $PWD, ${PWD}, ~
+#
+# You can repeat rw= and ro= multiple times.
+
+[llm]
+start=$PWD
+rw=$PWD
+
+# Minimal /dev - specific devices only
+rw=/dev/null
+rw=/dev/zero
+rw=/dev/urandom
+rw=/dev/random
+rw=/dev/tty
+# /proc/self is a symlink; Landlock rules don't survive exec through it — use ro=/proc
+ro=/proc
+ro=/sys/devices/system/cpu
+
+# Network/name resolution
+ro=/etc/ssl
+ro=/etc/ca-certificates
+ro=/etc/resolv.conf
+ro=/etc/hosts
+ro=/etc/nsswitch.conf
+ro=/etc/passwd
+ro=/etc/group
+
+# Claude / Codex
+rw=~/.claude/
+rw=~/.codex/
+ro=~/.local/bin/claude
+ro=~/.npm-global/
+EOF
+
+  cat >&2 <<EOF_MSG
+Created config: $CONFIG
+
+Edit the config to add or adjust profiles, then run: jailsh PROFILE
+EOF_MSG
+}
+
+ensure_config_exists() {
+  if [[ ! -f "$CONFIG" ]]; then
+    create_default_config
+    exit 0
+  fi
+}
+
+list_profiles() {
+  ensure_config_exists
+
+  local line section found=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    line="$(trim "$line")"
+    [[ -z "$line" || ${line:0:1} == '#' || ${line:0:1} == ';' ]] && continue
+    if [[ "$line" =~ ^\[(.+)\]$ ]]; then
+      section="${BASH_REMATCH[1]}"
+      printf '%s\n' "$section"
+      (( found++ )) || true
+    fi
+  done < "$CONFIG"
+  if (( !found )); then
+    printf 'No profiles defined in %s\n' "$CONFIG" >&2
+    printf "Add a [profile-name] section to the config file, then run: jailsh PROFILE\n" >&2
+  fi
+}
+
+[[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && usage
+[[ "${1:-}" == "--list" ]] && { list_profiles; exit 0; }
+[[ -n "$PROFILE" ]] || usage
+
+ensure_config_exists
+
+START=""
+declare -a RW=()
+declare -a RO=()
+section=""
+found=0
+
+while IFS= read -r raw || [[ -n "$raw" ]]; do
+  line="${raw%$'\r'}"
+  line="$(trim "$line")"
+
+  [[ -z "$line" || ${line:0:1} == '#' || ${line:0:1} == ';' ]] && continue
+
+  if [[ "$line" =~ ^\[(.+)\]$ ]]; then
+    section="${BASH_REMATCH[1]}"
+    continue
+  fi
+
+  [[ "$section" == "$PROFILE" ]] || continue
+  found=1
+
+  [[ "$line" == *=* ]] || {
+    echo "Invalid line in [$PROFILE]: $line" >&2
+    exit 1
+  }
+
+  key="$(trim "${line%%=*}")"
+  value="$(trim "${line#*=}")"
+
+  case "$key" in
+    start) START="$(expand_path "$value")" ;;
+    rw) RW+=("$(expand_path "$value")") ;;
+    ro) RO+=("$(expand_path "$value")") ;;
+    *)
+      echo "Unknown key in [$PROFILE]: $key" >&2
+      exit 1
+      ;;
+  esac
+done < "$CONFIG"
+
+(( found )) || {
+  printf "Profile '%s' not found. Run 'jailsh --list' to see available profiles.\n" "$PROFILE" >&2
+  exit 1
+}
+
+if [[ -z "$START" ]]; then
+  if [[ ${#RW[@]} -gt 0 ]]; then
+    START="${RW[0]}"
+  elif [[ ${#RO[@]} -gt 0 ]]; then
+    START="${RO[0]}"
+  else
+    echo "Profile [$PROFILE] has no rw= or ro= entries" >&2
+    exit 1
+  fi
+fi
+
+if [[ ! -d "$START" ]]; then
+  mkdir -p -- "$START" || { echo "Cannot create start directory: $START" >&2; exit 1; }
+fi
+
+declare -a RW_EXISTING=()
+for p in "${RW[@]}"; do
+  if [[ -e "$p" ]]; then
+    RW_EXISTING+=("$p")
+  fi
+done
+RW=("${RW_EXISTING[@]+"${RW_EXISTING[@]}"}")
+
+declare -a RO_EXISTING=()
+for p in "${RO[@]}"; do
+  if [[ -e "$p" ]]; then
+    RO_EXISTING+=("$p")
+  fi
+done
+RO=("${RO_EXISTING[@]+"${RO_EXISTING[@]}"}")
+
+if ! command -v cc >/dev/null 2>&1; then
+  echo "Need a C compiler. On Ubuntu: sudo apt install build-essential linux-libc-dev" >&2
+  exit 1
+fi
+
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/jailsh"
+mkdir -p "$CACHE_DIR"
+SRC="$CACHE_DIR/jailsh-landlock.c"
+BIN="$CACHE_DIR/jailsh-landlock"
+NEW_SRC="$CACHE_DIR/.jailsh-landlock.c.$$"
+
+cat > "$NEW_SRC" <<'EOF_C'
+#define _GNU_SOURCE
+#include <linux/landlock.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+
+#ifndef LANDLOCK_CREATE_RULESET_VERSION
+#define LANDLOCK_CREATE_RULESET_VERSION 0x00000001U
+#endif
+
+static int ll_create_ruleset(const struct landlock_ruleset_attr *attr, size_t size, __u32 flags) {
+    return syscall(__NR_landlock_create_ruleset, attr, size, flags);
+}
+
+static int ll_add_rule(int ruleset_fd, enum landlock_rule_type rule_type,
+                       const void *rule_attr, __u32 flags) {
+    return syscall(__NR_landlock_add_rule, ruleset_fd, rule_type, rule_attr, flags);
+}
+
+static int ll_restrict_self(int ruleset_fd, __u32 flags) {
+    return syscall(__NR_landlock_restrict_self, ruleset_fd, flags);
+}
+
+static __u64 fs_ro_file_access(void) {
+    return LANDLOCK_ACCESS_FS_EXECUTE |
+           LANDLOCK_ACCESS_FS_READ_FILE;
+}
+
+static __u64 fs_rw_file_access(void) {
+    __u64 a =
+        LANDLOCK_ACCESS_FS_EXECUTE |
+        LANDLOCK_ACCESS_FS_WRITE_FILE |
+        LANDLOCK_ACCESS_FS_READ_FILE;
+#ifdef LANDLOCK_ACCESS_FS_TRUNCATE
+    a |= LANDLOCK_ACCESS_FS_TRUNCATE;
+#endif
+    return a;
+}
+
+static int add_path_rule(int ruleset_fd, const char *path, __u64 dir_access, __u64 file_access) {
+    struct stat st;
+    if (stat(path, &st) < 0) {
+        fprintf(stderr, "stat(%s): %s\n", path, strerror(errno));
+        return -1;
+    }
+
+    __u64 allowed_access = S_ISDIR(st.st_mode) ? dir_access : file_access;
+    int fd = open(path, O_PATH | O_CLOEXEC);
+    if (fd < 0) {
+        fprintf(stderr, "open(%s): %s\n", path, strerror(errno));
+        return -1;
+    }
+
+    struct landlock_path_beneath_attr rule = {
+        .allowed_access = allowed_access,
+        .parent_fd = fd,
+    };
+
+    int rc = ll_add_rule(ruleset_fd, LANDLOCK_RULE_PATH_BENEATH, &rule, 0);
+    int saved = errno;
+    close(fd);
+
+    if (rc < 0) {
+        errno = saved;
+        fprintf(stderr, "landlock_add_rule(%s): %s\n", path, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+static __u64 fs_ro_access(void) {
+    return LANDLOCK_ACCESS_FS_EXECUTE |
+           LANDLOCK_ACCESS_FS_READ_FILE |
+           LANDLOCK_ACCESS_FS_READ_DIR;
+}
+
+static __u64 fs_rw_access(void) {
+    __u64 a =
+        LANDLOCK_ACCESS_FS_EXECUTE |
+        LANDLOCK_ACCESS_FS_WRITE_FILE |
+        LANDLOCK_ACCESS_FS_READ_FILE |
+        LANDLOCK_ACCESS_FS_READ_DIR |
+        LANDLOCK_ACCESS_FS_REMOVE_DIR |
+        LANDLOCK_ACCESS_FS_REMOVE_FILE |
+        LANDLOCK_ACCESS_FS_MAKE_DIR |
+        LANDLOCK_ACCESS_FS_MAKE_REG |
+        LANDLOCK_ACCESS_FS_MAKE_SYM |
+        LANDLOCK_ACCESS_FS_MAKE_FIFO |
+        LANDLOCK_ACCESS_FS_MAKE_SOCK;
+#ifdef LANDLOCK_ACCESS_FS_REFER
+    a |= LANDLOCK_ACCESS_FS_REFER;
+#endif
+#ifdef LANDLOCK_ACCESS_FS_TRUNCATE
+    a |= LANDLOCK_ACCESS_FS_TRUNCATE;
+#endif
+    return a;
+}
+
+int main(int argc, char **argv) {
+    if (argc < 4) {
+        fprintf(stderr, "usage: %s <shell> <startdir> <tmpdir-or-empty> <rule...>\n", argv[0]);
+        return 2;
+    }
+
+    const char *shell = argv[1];
+    const char *startdir = argv[2];
+    const char *tmpdir = argv[3];
+
+    int abi = ll_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION);
+    if (abi < 0) {
+        if (errno == ENOSYS) {
+            fprintf(stderr, "Landlock is not supported by this kernel.\n");
+        } else if (errno == EOPNOTSUPP) {
+            fprintf(stderr, "Landlock is disabled in this kernel or boot configuration.\n");
+        } else {
+            fprintf(stderr, "landlock_create_ruleset(version): %s\n", strerror(errno));
+        }
+        return 1;
+    }
+
+    struct landlock_ruleset_attr ruleset = {0};
+    ruleset.handled_access_fs = fs_rw_access();
+
+#ifdef LANDLOCK_ACCESS_FS_REFER
+    if (abi < 2) ruleset.handled_access_fs &= ~LANDLOCK_ACCESS_FS_REFER;
+#endif
+#ifdef LANDLOCK_ACCESS_FS_TRUNCATE
+    if (abi < 3) ruleset.handled_access_fs &= ~LANDLOCK_ACCESS_FS_TRUNCATE;
+#endif
+
+    int ruleset_fd = ll_create_ruleset(&ruleset, sizeof(ruleset), 0);
+    if (ruleset_fd < 0) {
+        fprintf(stderr, "landlock_create_ruleset: %s\n", strerror(errno));
+        return 1;
+    }
+
+    const char *runtime_ro[] = {
+        "/bin",
+        "/usr",
+        "/lib",
+        "/lib64",
+        "/usr/lib",
+        "/usr/lib64",
+        NULL
+    };
+
+    for (size_t i = 0; runtime_ro[i]; ++i) {
+        struct stat _st;
+        if (stat(runtime_ro[i], &_st) < 0) continue;
+        if (add_path_rule(ruleset_fd, runtime_ro[i], fs_ro_access(), fs_ro_file_access()) < 0) {
+            close(ruleset_fd);
+            return 1;
+        }
+    }
+
+    int cmd_start = -1;
+    for (int i = 4; i < argc; ++i) {
+        const char *spec = argv[i];
+        if (strcmp(spec, "--") == 0) {
+            cmd_start = i + 1;
+            break;
+        }
+        const char *colon = strchr(spec, ':');
+        if (!colon || colon == spec || !colon[1]) {
+            fprintf(stderr, "Bad rule: %s\n", spec);
+            close(ruleset_fd);
+            return 2;
+        }
+
+        __u64 access;
+        switch (spec[0]) {
+            case 'R': access = fs_rw_access(); break;
+            case 'r': access = fs_ro_access(); break;
+            default:
+                fprintf(stderr, "Unknown rule mode: %s\n", spec);
+                close(ruleset_fd);
+                return 2;
+        }
+
+        __u64 file_access = spec[0] == 'R' ? fs_rw_file_access() : fs_ro_file_access();
+        if (add_path_rule(ruleset_fd, colon + 1, access, file_access) < 0) {
+            close(ruleset_fd);
+            return 1;
+        }
+    }
+
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)) {
+        fprintf(stderr, "prctl(PR_SET_NO_NEW_PRIVS): %s\n", strerror(errno));
+        close(ruleset_fd);
+        return 1;
+    }
+
+    if (ll_restrict_self(ruleset_fd, 0)) {
+        fprintf(stderr, "landlock_restrict_self: %s\n", strerror(errno));
+        close(ruleset_fd);
+        return 1;
+    }
+    close(ruleset_fd);
+
+    if (chdir(startdir) < 0) {
+        fprintf(stderr, "chdir(%s): %s\n", startdir, strerror(errno));
+        return 1;
+    }
+
+    setenv("JAILSH_STARTDIR", startdir, 1);
+    setenv("JAILSH_REAL_HOME", getenv("HOME") ? getenv("HOME") : "", 1);
+    setenv("HOME", startdir, 1);
+    setenv("PWD", startdir, 1);
+    setenv("PS1", "jailsh:\\w$ ", 1);
+    if (tmpdir && tmpdir[0]) {
+        setenv("TMPDIR", tmpdir, 1);
+    }
+
+    if (cmd_start != -1 && cmd_start < argc) {
+        execvp(argv[cmd_start], &argv[cmd_start]);
+        fprintf(stderr, "execvp(%s): %s\n", argv[cmd_start], strerror(errno));
+    } else {
+        char *const sh_argv[] = { (char *)shell, "--noprofile", "--norc", "-i", NULL };
+        execv(shell, sh_argv);
+        fprintf(stderr, "execv(%s): %s\n", shell, strerror(errno));
+    }
+    return 1;
+}
+EOF_C
+
+if [[ ! -f "$SRC" ]] || ! cmp -s "$NEW_SRC" "$SRC"; then
+  mv -f "$NEW_SRC" "$SRC"
+else
+  rm -f "$NEW_SRC"
+fi
+
+if [[ ! -x "$BIN" || "$SRC" -nt "$BIN" ]]; then
+  cc -O2 -Wall -Wextra -std=c11 "$SRC" -o "$BIN"
+fi
+
+BASH_BIN="$(command -v bash)"
+TMPDIR_PATH="$CACHE_DIR/tmp/$PROFILE"
+mkdir -p -- "$TMPDIR_PATH"
+
+ARGV=("$BIN" "$BASH_BIN" "$START" "$TMPDIR_PATH")
+for p in "${RW[@]}"; do
+  ARGV+=("R:$p")
+done
+ARGV+=("R:$TMPDIR_PATH")
+for p in "${RO[@]}"; do
+  ARGV+=("r:$p")
+done
+
+if [[ ${#CMD[@]} -gt 0 ]]; then
+  ARGV+=("--" "${CMD[@]}")
+fi
+
+exec "${ARGV[@]}"
