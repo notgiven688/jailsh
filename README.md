@@ -1,20 +1,20 @@
-# jailsh
+# jail-sh
 
 <img src="logo.png" width="250" />
 
-`jailsh` starts a Bash shell with filesystem access restricted by Linux Landlock. You define named profiles that specify which directories the shell can read or write — everything else is blocked.
+`jail-sh` starts a Bash shell with filesystem access restricted by Linux Landlock. You define named profiles that specify which directories the shell can read or write — everything else is blocked.
 
 The main motivation: running LLM CLI tools (Claude Code, Gemini CLI, Aider, …) with their "trust me" / skip-permissions flags, but without actually trusting them with your whole filesystem. Give the agent access to your project directory and nothing else. 🤖
 
 ```bash
-jailsh llm claude --dangerously-skip-permissions
+jail-sh llm claude --dangerously-skip-permissions
 ```
 
 ## 🤔 Why
 
 Modern LLM CLIs are powerful — and they often ask you to disable their safety guardrails so they can read, write, and execute freely. That's fine for a controlled environment, but handing them unrestricted access to your home directory is not.
 
-`jailsh` lets you keep the `--dangerously-skip-permissions` workflow while enforcing real kernel-level boundaries:
+`jail-sh` lets you keep the `--dangerously-skip-permissions` workflow while enforcing real kernel-level boundaries:
 
 - The agent can only see the directories you allow.
 - Reads of `~/.ssh`, `~/.gnupg`, other projects, shell history, credentials files, etc. are blocked at the kernel level.
@@ -31,14 +31,14 @@ Modern LLM CLIs are powerful — and they often ask you to disable their safety 
 System-wide:
 
 ```bash
-sudo install -m 0755 jailsh /usr/local/bin/jailsh
+sudo install -m 0755 jail-sh /usr/local/bin/jail-sh
 ```
 
 Per-user (make sure `~/.local/bin` is in your `$PATH`):
 
 ```bash
 install -d "$HOME/.local/bin"
-install -m 0755 jailsh "$HOME/.local/bin/jailsh"
+install -m 0755 jail-sh "$HOME/.local/bin/jail-sh"
 ```
 
 Or use `install.sh`, which defaults to `/usr/local` and respects a `PREFIX` override:
@@ -53,26 +53,26 @@ PREFIX=~/.local bash install.sh
 Run an LLM CLI inside the sandbox (single command, exits when done):
 
 ```bash
-jailsh llm claude --dangerously-skip-permissions
-jailsh llm aider
-jailsh llm gemini
+jail-sh llm claude --dangerously-skip-permissions
+jail-sh llm aider
+jail-sh llm gemini
 ```
 
 Start an interactive sandboxed shell using a profile:
 
 ```bash
-jailsh work
+jail-sh work
 ```
 
 List all profiles defined in the config file:
 
 ```bash
-jailsh --list
+jail-sh --list
 ```
 
 ## ⚙️ Config
 
-The config file lives at `~/.config/jailsh/config.ini` (or `$XDG_CONFIG_HOME/jailsh/config.ini` if that variable is set). On first run, `jailsh` creates the file and exits — edit it to add a profile, then run again.
+The config file lives at `~/.config/jail-sh/config.ini` (or `$XDG_CONFIG_HOME/jail-sh/config.ini` if that variable is set). On first run, `jail-sh` creates the file and exits — edit it to add a profile, then run again.
 
 Example config:
 
@@ -128,5 +128,5 @@ Path values support `~`, `$HOME`, and `$PWD` (expanded at runtime).
 
 ## 📝 Notes
 
-- The Landlock helper is compiled on first run and cached under `~/.cache/jailsh/`.
-- A writable temp directory is created automatically at `~/.cache/jailsh/tmp/<profile>/` and set as `$TMPDIR` inside the shell. Programs that write to `/tmp` will use this instead.
+- The Landlock helper is compiled on first run and cached under `~/.cache/jail-sh/`.
+- A writable temp directory is created automatically at `~/.cache/jail-sh/tmp/<profile>/` and set as `$TMPDIR` inside the shell. Programs that write to `/tmp` will use this instead.

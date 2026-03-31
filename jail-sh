@@ -2,11 +2,11 @@
 set -euo pipefail
 
 XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
-DEFAULT_CONFIG="$XDG_CONFIG_HOME/jailsh/config.ini"
-LEGACY_CONFIG="$HOME/.jailsh.ini"
+DEFAULT_CONFIG="$XDG_CONFIG_HOME/jail-sh/config.ini"
+LEGACY_CONFIG="$HOME/.jail-sh.ini"
 
-if [[ -n "${JAILSH_CONFIG:-}" ]]; then
-  CONFIG="$JAILSH_CONFIG"
+if [[ -n "${JAIL_SH_CONFIG:-}" ]]; then
+  CONFIG="$JAIL_SH_CONFIG"
 elif [[ -f "$DEFAULT_CONFIG" || ! -f "$LEGACY_CONFIG" ]]; then
   CONFIG="$DEFAULT_CONFIG"
 else
@@ -17,16 +17,16 @@ CMD=("${@:2}")
 
 usage() {
   cat >&2 <<'USAGE'
-jailsh — run a sandboxed Bash shell with filesystem access restricted by Landlock
+jail-sh — run a sandboxed Bash shell with filesystem access restricted by Landlock
 
 Usage:
-  jailsh PROFILE             start a shell using the named profile
-  jailsh PROFILE CMD [ARG…]  run a command inside the sandbox and exit
-  jailsh --list              list profiles from the config file
-  jailsh --help              show this help
+  jail-sh PROFILE             start a shell using the named profile
+  jail-sh PROFILE CMD [ARG…]  run a command inside the sandbox and exit
+  jail-sh --list              list profiles from the config file
+  jail-sh --help              show this help
 
 Config file:
-  ~/.config/jailsh/config.ini   (or $XDG_CONFIG_HOME/jailsh/config.ini)
+  ~/.config/jail-sh/config.ini   (or $XDG_CONFIG_HOME/jail-sh/config.ini)
   Created automatically on first run if it does not exist.
 
 Profile keys:
@@ -71,7 +71,7 @@ create_default_config() {
   mkdir -p -- "$(dirname "$CONFIG")"
 
   cat > "$CONFIG" <<'EOF'
-# jailsh profile config
+# jail-sh profile config
 #
 # Keys:
 #   start=DIR   shell starts here
@@ -116,7 +116,7 @@ EOF
   cat >&2 <<EOF_MSG
 Created config: $CONFIG
 
-Edit the config to add or adjust profiles, then run: jailsh PROFILE
+Edit the config to add or adjust profiles, then run: jail-sh PROFILE
 EOF_MSG
 }
 
@@ -143,7 +143,7 @@ list_profiles() {
   done < "$CONFIG"
   if (( !found )); then
     printf 'No profiles defined in %s\n' "$CONFIG" >&2
-    printf "Add a [profile-name] section to the config file, then run: jailsh PROFILE\n" >&2
+    printf "Add a [profile-name] section to the config file, then run: jail-sh PROFILE\n" >&2
   fi
 }
 
@@ -193,7 +193,7 @@ while IFS= read -r raw || [[ -n "$raw" ]]; do
 done < "$CONFIG"
 
 (( found )) || {
-  printf "Profile '%s' not found. Run 'jailsh --list' to see available profiles.\n" "$PROFILE" >&2
+  printf "Profile '%s' not found. Run 'jail-sh --list' to see available profiles.\n" "$PROFILE" >&2
   exit 1
 }
 
@@ -233,11 +233,11 @@ if ! command -v cc >/dev/null 2>&1; then
   exit 1
 fi
 
-CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/jailsh"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/jail-sh"
 mkdir -p "$CACHE_DIR"
-SRC="$CACHE_DIR/jailsh-landlock.c"
-BIN="$CACHE_DIR/jailsh-landlock"
-NEW_SRC="$CACHE_DIR/.jailsh-landlock.c.$$"
+SRC="$CACHE_DIR/jail-sh-landlock.c"
+BIN="$CACHE_DIR/jail-sh-landlock"
+NEW_SRC="$CACHE_DIR/.jail-sh-landlock.c.$$"
 
 cat > "$NEW_SRC" <<'EOF_C'
 #define _GNU_SOURCE
@@ -451,11 +451,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    setenv("JAILSH_STARTDIR", startdir, 1);
-    setenv("JAILSH_REAL_HOME", getenv("HOME") ? getenv("HOME") : "", 1);
+    setenv("JAIL_SH_STARTDIR", startdir, 1);
+    setenv("JAIL_SH_REAL_HOME", getenv("HOME") ? getenv("HOME") : "", 1);
     setenv("HOME", startdir, 1);
     setenv("PWD", startdir, 1);
-    setenv("PS1", "jailsh:\\w$ ", 1);
+    setenv("PS1", "jail-sh:\\w$ ", 1);
     if (tmpdir && tmpdir[0]) {
         setenv("TMPDIR", tmpdir, 1);
     }

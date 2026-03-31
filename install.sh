@@ -6,6 +6,6 @@ set -euo pipefail
 prefix="${PREFIX:-/usr/local}"
 
 install -d "$prefix/bin"
-install -m 0755 jailsh "$prefix/bin/jailsh"
+install -m 0755 jail-sh "$prefix/bin/jail-sh"
 
-printf 'Installed to %s/bin/jailsh\n' "$prefix"
+printf 'Installed to %s/bin/jail-sh\n' "$prefix"
